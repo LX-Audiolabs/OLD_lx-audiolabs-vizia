@@ -1,0 +1,42 @@
+/target/
+/backup/
+**/*.rs.bk
+
+# Cloud storage sync temps
+.tmp.driveupload/
+.tmp.drivedownload/
+
+# Cargo/Rust defaults
+Cargo.lock.backup
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+*.clap
+*.vst3
+
+# Graphify knowledge graph (generated)
+/graphify-out/
+graphify-out.zip
+
+# Bug reports (local)
+truce-rightclick-bug-report.md
+
+# Custom build logs
+check.log
+
+# MCP config (absolute Vault-Pfad, per machine)
+.mcp.json
+
+# Claude Code — untracked, personal per machine
+/CLAUDE.md
+/.claude/
+
+# Editor — personal per machine
+/.vscode/
+
+node_modules/
+.cargo-tools/
+.venv/
+AGENTS.md

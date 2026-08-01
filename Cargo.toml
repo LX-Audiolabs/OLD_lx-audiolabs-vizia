@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "vendor/baseview",
+    "vendor/vizia-baseview",
+    "crates/lx-dsp",
+    "crates/lx-analysis",
+    "crates/lx-vault",
+    "crates/lx-ui",
+    "crates/lx-shm",
+    "plugins/lucent",
+    "plugins/lucent-relay",
+    "plugins/aether",
+    "plugins/equilibrium",
+    "plugins/meridian",
+]
+resolver = "3"
+
+[workspace.dependencies]
+# LX fork: main = upstream + suite patches. No PRs upstream.
+truce           = { git = "https://github.com/LX-Audiolabs/truce", branch = "main", default-features = false }
+truce-core      = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-params    = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-clap      = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-vst3      = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-lv2       = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-loader    = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-test      = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+truce-vizia     = { git = "https://github.com/LX-Audiolabs/truce", branch = "main" }
+# clipboard = copypasta via vizia_core; without it Textbox Ctrl+V/C/X is a no-op
+# (Paste/Copy arms are #[cfg(feature = "clipboard")]). Needed for vault path paste.
+# Linux also needs vizia/x11 (see lx-ui target deps) so copypasta exposes ClipboardContext.
+vizia           = { git = "https://github.com/vizia/vizia", branch = "main", default-features = false, features = ["baseview", "clipboard"] }
+clap-sys        = "0.5"
+time            = ">=0.3.47"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.shell]
+inherits = "release"
+
+[profile.dbg]
+inherits = "release"
+strip = false
+debug = "full"
+
+# Replace upstream vizia_baseview with our fork (parented-window fixes).
+[patch."https://github.com/vizia/vizia"]
+vizia_baseview = { path = "vendor/vizia-baseview" }
+
+# Replace crates.io baseview with vendored copy (new_parented() REAPER fix).
+[patch.crates-io]
+baseview = { path = "vendor/baseview" }

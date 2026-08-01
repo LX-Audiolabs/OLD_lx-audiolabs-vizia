@@ -1,0 +1,823 @@
+//! Drawing helpers and shared canvas views — extracted from Equilibrium's
+//! `vizia_canvas.rs` (Goniometer, StereoMeter, helpers) + Lucent's
+//! `vizia_canvas.rs` (SpectrumView, smooth_spectrum_third_octave).
+//!
+//! Plugin-specific views (EqSpectrumView, CompressorEnvelopeView, EqCurveView)
+//! live in their respective plugin crates.
+
+use std::cell::RefCell;
+use std::cell::Cell;
+use std::sync::{Arc, Mutex, OnceLock};
+use vizia::prelude::*;
+use vizia::vg;
+
+use crate::declare_layer_cache;
+use crate::layer_cache;
+
+thread_local! {
+    /// Reusable point buffer for GoniometerView to avoid per-frame allocations.
+    static GONIO_POINTS: RefCell<Vec<vg::Point>> = const { RefCell::new(Vec::new()) };
+    /// Reusable buffers for spectrum smoothing to avoid per-frame allocations.
+    static SMOOTH_POWER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static SMOOTH_RESULT: RefCell<Vec<(f32, f32)>> = const { RefCell::new(Vec::new()) };
+    static SMOOTH_DB: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `vg::Font::default()` builds a bare `SkFont` with no typeface attached -
+/// `canvas.draw_str()` silently draws nothing with it. Load the system
+/// default typeface once and reuse it for every `fill_text()` call.
+fn default_typeface() -> Option<vg::Typeface> {
+    static TYPEFACE: OnceLock<Option<vg::Typeface>> = OnceLock::new();
+    TYPEFACE
+        .get_or_init(|| vg::FontMgr::new().legacy_make_typeface(None, vg::FontStyle::default()))
+        .clone()
+}
+
+// ─── Drawing Helpers ─────────────────────────────────────────────────────────
+
+pub fn col(r: f32, g: f32, b: f32, a: f32) -> vg::Color {
+    vg::Color::from_argb(
+        (a.clamp(0.0, 1.0) * 255.0) as u8,
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
+pub fn rgb(r: f32, g: f32, b: f32) -> vg::Color {
+    col(r, g, b, 1.0)
+}
+
+pub fn stroke_paint(color: vg::Color, width: f32) -> vg::Paint {
+    let mut p = vg::Paint::default();
+    p.set_anti_alias(true);
+    p.set_color(color);
+    p.set_style(vg::PaintStyle::Stroke);
+    p.set_stroke_width(width);
+    p
+}
+
+pub fn fill_paint(color: vg::Color) -> vg::Paint {
+    let mut p = vg::Paint::default();
+    p.set_anti_alias(true);
+    p.set_color(color);
+    p.set_style(vg::PaintStyle::Fill);
+    p
+}
+
+pub fn line(canvas: &vg::Canvas, x1: f32, y1: f32, x2: f32, y2: f32, color: vg::Color, width: f32) {
+    canvas.draw_line((x1, y1), (x2, y2), &stroke_paint(color, width));
+}
+
+pub fn fill_text(canvas: &vg::Canvas, text: &str, x: f32, y: f32, size: f32, color: vg::Color) {
+    let f = match default_typeface() {
+        Some(tf) => vg::Font::new(tf, size),
+        None => {
+            let mut f = vg::Font::default();
+            f.set_size(size);
+            f
+        }
+    };
+    canvas.draw_str(text, (x, y), &f, &fill_paint(color));
+}
+
+pub fn fmt_db(v: f32) -> String {
+    if v <= -60.0 {
+        "-inf".to_string()
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+// ─── Stereo Meter ────────────────────────────────────────────────────────────
+
+pub struct StereoMeterView {
+    pub peak_l: f32,
+    pub peak_r: f32,
+    pub hold_l: f32,
+    pub hold_r: f32,
+    pub balance: f32,
+}
+
+impl StereoMeterView {
+    pub fn new(
+        cx: &mut Context,
+        peak_l: f32,
+        peak_r: f32,
+        hold_l: f32,
+        hold_r: f32,
+        balance: f32,
+    ) -> Handle<'_, Self> {
+        Self {
+            peak_l,
+            peak_r,
+            hold_l,
+            hold_r,
+            balance,
+        }
+        .build(cx, |_| {})
+    }
+}
+
+declare_layer_cache!(STEREO_METER_CACHE);
+
+impl View for StereoMeterView {
+    fn element(&self) -> Option<&'static str> {
+        Some("stereo-meter")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &vg::Canvas) {
+        let b = cx.bounds();
+        canvas.translate((b.x, b.y));
+        let (w, h) = (b.width(), b.height());
+        let gap = 36.0;
+        let bar_w = (w - gap) / 2.0;
+        let min_db = -60.0f32;
+        let max_db = 6.0f32;
+        let db_range = max_db - min_db;
+
+        let peak_l = self.peak_l;
+        let peak_r = self.peak_r;
+        let hold_l = self.hold_l;
+        let hold_r = self.hold_r;
+        let balance = self.balance;
+
+        layer_cache::draw_cached_layer(
+            &STEREO_METER_CACHE,
+            cx,
+            canvas,
+            0, // background only depends on size
+            |c| {
+                c.draw_rect(
+                    vg::Rect::new(0.0, 0.0, w, h),
+                    &fill_paint(rgb(0.08, 0.08, 0.08)),
+                );
+
+                for (idx, (_peak_db, _hold_db)) in
+                    [(peak_l, hold_l), (peak_r, hold_r)].iter().enumerate()
+                {
+                    let x = if idx == 0 { 0.0 } else { bar_w + gap };
+                    let label = if idx == 0 { "L" } else { "R" };
+                    fill_text(
+                        c,
+                        label,
+                        x + bar_w * 0.5 - 3.0,
+                        h - 14.0,
+                        9.0,
+                        col(1.0, 1.0, 1.0, 0.45),
+                    );
+                }
+
+                let gx = bar_w;
+                let center_x = gx + gap * 0.5;
+                for (db_val, label) in [
+                    (-3.0f32, "-3"),
+                    (-6.0, "-6"),
+                    (-12.0, "-12"),
+                    (-24.0, "-24"),
+                    (-48.0, "-48"),
+                ] {
+                    let norm = ((db_val - min_db) / db_range).clamp(0.0, 1.0);
+                    let y = h - h * norm;
+                    let tick_half = if label == "-3" || label == "-6" {
+                        5.0
+                    } else {
+                        3.0
+                    };
+                    line(
+                        c,
+                        center_x - tick_half,
+                        y,
+                        center_x + tick_half,
+                        y,
+                        col(1.0, 1.0, 1.0, 0.45),
+                        0.8,
+                    );
+                    fill_text(
+                        c,
+                        label,
+                        gx + 1.0,
+                        y - 5.0,
+                        8.0,
+                        col(1.0, 1.0, 1.0, 0.60),
+                    );
+                }
+
+                line(
+                    c,
+                    center_x,
+                    h * 0.82 - 5.0,
+                    center_x,
+                    h * 0.82 + 5.0,
+                    col(1.0, 1.0, 1.0, 0.12),
+                    0.8,
+                );
+            },
+            |c| {
+                for (idx, (peak_db, hold_db)) in [(peak_l, hold_l), (peak_r, hold_r)].iter().enumerate() {
+                    let x = if idx == 0 { 0.0 } else { bar_w + gap };
+                    let norm_peak = ((*peak_db - min_db) / db_range).clamp(0.0, 1.0);
+                    let bar_h = h * norm_peak;
+                    let color = if *peak_db > 0.0 {
+                        rgb(1.0, 0.25, 0.25)
+                    } else if *peak_db > -6.0 {
+                        rgb(1.0, 0.55, 0.1)
+                    } else {
+                        rgb(0.0, 0.75, 0.3)
+                    };
+                    c.draw_rect(
+                        vg::Rect::new(x + 1.0, h - bar_h, x + bar_w - 1.0, h),
+                        &fill_paint(color),
+                    );
+                    if *hold_db > min_db {
+                        let norm_hold = ((*hold_db - min_db) / db_range).clamp(0.0, 1.0);
+                        let hold_y = h - h * norm_hold;
+                        line(c, x, hold_y, x + bar_w, hold_y, vg::Color::WHITE, 1.5);
+                    }
+                }
+
+                let gx = bar_w;
+                let center_x = gx + gap * 0.5;
+                let balance_norm = balance.clamp(-1.0, 1.0);
+                let cursor_x = center_x - balance_norm * (gap * 0.35);
+                let cursor_y = h * 0.82;
+                let cursor_color = if balance_norm.abs() < 0.08 {
+                    rgb(0.0, 0.85, 0.35)
+                } else {
+                    rgb(1.0, 0.45, 0.1)
+                };
+                c.draw_circle((cursor_x, cursor_y), 3.5, &fill_paint(cursor_color));
+            },
+        );
+    }
+}
+
+// ─── Goniometer ──────────────────────────────────────────────────────────────
+
+pub struct GoniometerView {
+    pub samples: Arc<Mutex<Vec<[f32; 2]>>>,
+    pub write_pos: usize,
+    pub correlation: f32,
+}
+
+impl GoniometerView {
+    pub fn new(
+        cx: &mut Context,
+        samples: Arc<Mutex<Vec<[f32; 2]>>>,
+        write_pos: impl Res<usize>,
+        correlation: impl Res<f32>,
+    ) -> Handle<'_, Self> {
+        Self {
+            samples,
+            write_pos: write_pos.get_value(cx),
+            correlation: correlation.get_value(cx),
+        }
+        .build(cx, |_| {})
+    }
+}
+
+declare_layer_cache!(GONIOMETER_CACHE);
+
+impl View for GoniometerView {
+    fn element(&self) -> Option<&'static str> {
+        Some("goniometer")
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &vg::Canvas) {
+        let b = cx.bounds();
+        canvas.translate((b.x, b.y));
+        let (w, h) = (b.width(), b.height());
+        let (cx_, cy) = (w * 0.5, h * 0.5);
+        let scale = cx_.min(cy) * 0.9;
+
+        layer_cache::draw_cached_layer(
+            &GONIOMETER_CACHE,
+            cx,
+            canvas,
+            0,
+            |c| {
+                c.draw_rect(
+                    vg::Rect::new(0.0, 0.0, w, h),
+                    &fill_paint(rgb(0.06, 0.06, 0.06)),
+                );
+
+                let grid = col(1.0, 1.0, 1.0, 0.08);
+                line(c, cx_, 0.0, cx_, h, grid, 1.0);
+                line(c, 0.0, cy, w, cy, grid, 1.0);
+                line(c, 0.0, 0.0, w, h, grid, 1.0);
+                line(c, w, 0.0, 0.0, h, grid, 1.0);
+                c.draw_circle(
+                    (cx_, cy),
+                    scale,
+                    &stroke_paint(col(1.0, 1.0, 1.0, 0.06), 1.0),
+                );
+            },
+            |c| {
+                if let Ok(samples) = self.samples.lock() {
+                    let n = samples.len();
+                    if n > 0 {
+                        // ponytail: testing reduced point count for performance
+                        let draw_count = n.min(1024);
+                        let third = draw_count / 3;
+                        let wp = self.write_pos % n;
+                        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+                        // ponytail: batched via canvas.draw_points (native Skia point-list
+                        // primitive), NOT the lyon fill-tessellator that caused the 2026-07-04
+                        // host freeze (bugs/all/2026-07-04-goniometer-batch-fill-host-freeze) -
+                        // that bug was in lyon's O(N^2) multi-subpath fill, unrelated to this API.
+                        for group in 0..3u8 {
+                            let alpha = match group {
+                                0 => 0.12,
+                                1 => 0.30,
+                                _ => 0.72,
+                            };
+                            let dot_color = col(0.1, 0.9, 0.5, alpha);
+                            let start = group as usize * third;
+                            let end = if group == 2 {
+                                draw_count
+                            } else {
+                                (group as usize + 1) * third
+                            };
+
+                            GONIO_POINTS.with(|buf| {
+                                let mut points = buf.borrow_mut();
+                                points.clear();
+                                points.reserve(end - start);
+                                for k in start..end {
+                                    let age = draw_count - 1 - k;
+                                    let idx = (wp + n - age - 1) % n;
+                                    let [l, r] = samples[idx];
+                                    let m = (l + r) * inv_sqrt2;
+                                    let s = (l - r) * inv_sqrt2;
+                                    let sx = cx_ - s * scale;
+                                    let sy = cy - m * scale;
+                                    if sx >= 0.0 && sx <= w && sy >= 0.0 && sy <= h {
+                                        points.push((sx, sy).into());
+                                    }
+                                }
+                                let mut paint = fill_paint(dot_color);
+                                paint.set_style(vg::PaintStyle::Stroke);
+                                paint.set_stroke_width(1.8); // matches previous draw_circle radius 0.9 (diameter 1.8)
+                                paint.set_stroke_cap(vg::PaintCap::Round);
+                                c.draw_points(vg::canvas::PointMode::Points, &points, &paint);
+                            });
+                        }
+                    }
+                }
+
+                let corr = self.correlation.clamp(-1.0, 1.0);
+                let dot_color = if corr > 0.7 {
+                    rgb(0.0, 0.75, 0.3)
+                } else if corr >= 0.0 {
+                    rgb(1.0, 0.55, 0.1)
+                } else {
+                    rgb(1.0, 0.25, 0.25)
+                };
+                let (dot_x, dot_y) = (8.0, h - 8.0);
+                c.draw_circle((dot_x, dot_y), 3.5, &fill_paint(dot_color));
+                let sign = if corr >= 0.0 { "+" } else { "" };
+                fill_text(
+                    c,
+                    &format!("{sign}{corr:.2}"),
+                    dot_x + 7.0,
+                    dot_y - 5.5,
+                    9.0,
+                    rgb(1.0, 0.65, 0.3),
+                );
+            },
+        );
+    }
+}
+
+// ─── FFT Spectrum ────────────────────────────────────────────────────────────
+
+/// Transfer-function curve for EQ overlay on SpectrumView.
+/// `points` are `(x_norm, db)` pairs (normalized x, dB value).
+#[derive(Clone, PartialEq)]
+pub struct EqCurve {
+    pub points: Vec<(f32, f32)>,
+    pub min_db: f32,
+    pub max_db: f32,
+    pub line_color: vg::Color,
+    pub fill_alpha: f32,
+}
+
+#[derive(Clone)]
+pub struct SpectrumCurve {
+    pub spectrum: Vec<f32>,
+    pub color: vg::Color,
+    pub fill_alpha: f32,
+    pub line_alpha: f32,
+    pub line_width: f32,
+}
+
+#[derive(Clone)]
+pub struct SpectrumConfig {
+    pub min_db: f32,
+    pub max_db: f32,
+    pub sample_rate: f32,
+    pub fft_size: usize,
+    pub db_grid: Vec<f32>,
+    pub freq_grid: Vec<f32>,
+}
+
+impl Default for SpectrumConfig {
+    fn default() -> Self {
+        Self {
+            min_db: -70.0,
+            max_db: -18.0,
+            sample_rate: 44100.0,
+            fft_size: 2048,
+            db_grid: vec![-70.0, -50.0, -30.0, -18.0],
+            freq_grid: vec![100.0, 1000.0, 10000.0],
+        }
+    }
+}
+
+pub struct SpectrumView {
+    pub curves: Vec<SpectrumCurve>,
+    pub config: SpectrumConfig,
+    pub resonance_peaks: Vec<(usize, f32)>,
+    pub masking: Vec<f32>,
+    pub eq_curve: Option<EqCurve>,
+    /// Frequency of the resonance peak currently hovered by the mouse (Hz).
+    /// `None` when no peak is under the cursor. Used for tooltip rendering.
+    pub hovered_freq: Cell<Option<f32>>,
+}
+
+impl SpectrumView {
+    pub fn new(cx: &mut Context, data: Self) -> Handle<'_, Self> {
+        Self {
+            curves: data.curves,
+            config: data.config,
+            resonance_peaks: data.resonance_peaks,
+            masking: data.masking,
+            eq_curve: data.eq_curve,
+            hovered_freq: Cell::new(None),
+        }
+        .build(cx, |_| {})
+    }
+}
+
+declare_layer_cache!(SPECTRUM_CACHE);
+
+fn hash_f32_slice(values: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for v in values {
+        v.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+impl View for SpectrumView {
+    fn element(&self) -> Option<&'static str> {
+        Some("spectrum")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event: &WindowEvent, _meta| match window_event {
+            WindowEvent::MouseMove(x, y) => {
+                let b = cx.bounds();
+                let local_x = x - b.x;
+                let local_y = y - b.y;
+                let sample_rate = self.config.sample_rate;
+                let log_freq = |f: f32| -> f32 {
+                    ((f.ln() - 20.0f32.ln()) / (20000.0f32.ln() - 20.0f32.ln()))
+                        .clamp(0.0, 1.0)
+                };
+                let width = b.width();
+                // Hit-test: diamond at (x, 5.0) with ~10px radius
+                const HIT_RADIUS: f32 = 10.0;
+                const HIT_RADIUS_SQ: f32 = HIT_RADIUS * HIT_RADIUS;
+                let mut found = None;
+                for (bin, _score) in &self.resonance_peaks {
+                    let freq = *bin as f32 * sample_rate / self.config.fft_size as f32;
+                    if !(20.0..=20000.0).contains(&freq) {
+                        continue;
+                    }
+                    let px = log_freq(freq) * width;
+                    let dx = local_x - px;
+                    let dy = local_y - 5.0; // diamond Y
+                    if (dx * dx + dy * dy) <= HIT_RADIUS_SQ {
+                        found = Some(freq);
+                        break;
+                    }
+                }
+                if self.hovered_freq.get() != found {
+                    self.hovered_freq.set(found);
+                    cx.needs_redraw();
+                }
+            }
+            WindowEvent::MouseLeave => {
+                if self.hovered_freq.get().is_some() {
+                    self.hovered_freq.set(None);
+                    cx.needs_redraw();
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn draw(&self, cx: &mut DrawContext, canvas: &vg::Canvas) {
+        let b = cx.bounds();
+        canvas.translate((b.x, b.y));
+        let (width, height) = (b.width(), b.height());
+        let min_db = self.config.min_db;
+        let max_db = self.config.max_db;
+        let db_range = max_db - min_db;
+        let sample_rate = self.config.sample_rate;
+
+        let log_freq = |f: f32| -> f32 {
+            ((f.ln() - 20.0f32.ln()) / (20000.0f32.ln() - 20.0f32.ln())).clamp(0.0, 1.0)
+        };
+        let db_to_y = |db: f32| -> f32 {
+            let norm = ((db - min_db) / db_range).clamp(0.0, 1.0);
+            height - norm * height
+        };
+
+        let static_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_f32_slice(&self.config.db_grid).hash(&mut hasher);
+            hash_f32_slice(&self.config.freq_grid).hash(&mut hasher);
+            self.config.min_db.to_bits().hash(&mut hasher);
+            self.config.max_db.to_bits().hash(&mut hasher);
+            hasher.finish()
+        };
+
+        layer_cache::draw_cached_layer(
+            &SPECTRUM_CACHE,
+            cx,
+            canvas,
+            static_hash,
+            |c| {
+                c.draw_rect(
+                    vg::Rect::new(0.0, 0.0, width, height),
+                    &fill_paint(rgb(0.08, 0.08, 0.08)),
+                );
+
+                for &db in &self.config.db_grid {
+                    let y = {
+                        let norm = ((db - min_db) / db_range).clamp(0.0, 1.0);
+                        height - norm * height
+                    };
+                    line(c, 0.0, y, width, y, col(1.0, 1.0, 1.0, 0.12), 1.0);
+                }
+                for &f in &self.config.freq_grid {
+                    let x = log_freq(f) * width;
+                    line(c, x, 0.0, x, height, col(1.0, 1.0, 1.0, 0.06), 1.0);
+                }
+            },
+            |c| {
+                for curve in &self.curves {
+                    if curve.spectrum.is_empty() {
+                        continue;
+                    }
+                    let fft_size = curve.spectrum.len() * 2;
+                    SMOOTH_RESULT.with(|r| {
+                        let mut out = r.borrow_mut();
+                        smooth_spectrum_third_octave_into(
+                            &curve.spectrum,
+                            fft_size,
+                            sample_rate,
+                            &mut out,
+                        );
+                        if out.len() < 2 {
+                            return;
+                        }
+                        let smoothed = &*out;
+                        let first_x = smoothed[0].0 * width;
+
+                        let mut fill_builder = vg::PathBuilder::new();
+                        fill_builder.move_to((first_x, height));
+                        for &(sx, db) in smoothed {
+                            fill_builder.line_to((sx * width, db_to_y(db)));
+                        }
+                        let last_x = smoothed.last().unwrap().0 * width;
+                        fill_builder.line_to((last_x, height));
+                        fill_builder.close();
+                        let fill_path = fill_builder.detach();
+                        let (cr, cg, cb) = (
+                            curve.color.r() as f32 / 255.0,
+                            curve.color.g() as f32 / 255.0,
+                            curve.color.b() as f32 / 255.0,
+                        );
+                        c.draw_path(&fill_path, &fill_paint(col(cr, cg, cb, curve.fill_alpha)));
+
+                        let mut line_builder = vg::PathBuilder::new();
+                        line_builder.move_to((first_x, db_to_y(smoothed[0].1)));
+                        for &(sx, db) in &smoothed[1..] {
+                            line_builder.line_to((sx * width, db_to_y(db)));
+                        }
+                        let line_path = line_builder.detach();
+                        c.draw_path(
+                            &line_path,
+                            &stroke_paint(col(cr, cg, cb, curve.line_alpha), curve.line_width),
+                        );
+                    });
+                }
+
+                if !self.masking.is_empty() {
+                    let mask_fft_size = (self.masking.len() * 2) as f32;
+                    for (k, &db) in self.masking.iter().enumerate() {
+                        if db <= min_db {
+                            continue;
+                        }
+                        let freq = k as f32 * sample_rate / mask_fft_size;
+                        if !(20.0..=20000.0).contains(&freq) {
+                            continue;
+                        }
+                        let x = log_freq(freq) * width;
+                        let y = db_to_y(db);
+                        let severity = ((db - min_db) / db_range).clamp(0.0, 1.0);
+                        let color = col(0.95, 0.22, 0.18, 0.2 + severity * 0.6);
+                        line(c, x, height, x, y, color, 1.5);
+                    }
+                }
+
+                for (bin, score) in &self.resonance_peaks {
+                    let freq = *bin as f32 * sample_rate / self.config.fft_size as f32;
+                    if !(20.0..=20000.0).contains(&freq) {
+                        continue;
+                    }
+                    let x = log_freq(freq) * width;
+                    let alpha = (score / 20.0).clamp(0.2, 0.9);
+                    let marker_color = col(1.0, 0.6, 0.1, alpha);
+                    line(c, x, 0.0, x, height, marker_color, 1.5);
+                    let (s, my) = (3.0, 5.0);
+                    let mut diamond = vg::PathBuilder::new();
+                    diamond.move_to((x, my - s));
+                    diamond.line_to((x + s, my));
+                    diamond.line_to((x, my + s));
+                    diamond.line_to((x - s, my));
+                    diamond.close();
+                    c.draw_path(&diamond.detach(), &fill_paint(marker_color));
+                }
+
+                // Tooltip for hovered resonance peak
+                if let Some(hz) = self.hovered_freq.get() {
+                    let tx = log_freq(hz) * width;
+                    let tooltip_text = if hz >= 1000.0 {
+                        format!("{:.2} kHz", hz / 1000.0)
+                    } else {
+                        format!("{:.0} Hz", hz)
+                    };
+                    let font_size = 10.0;
+                    // ponytail: crude text width estimate — measure with 0.6 * font_size per char
+                    let text_width = tooltip_text.len() as f32 * font_size * 0.6;
+                    let padding = 4.0;
+                    let box_w = text_width + padding * 2.0;
+                    let box_h = font_size + padding * 2.0;
+                    let box_x = (tx - box_w * 0.5).clamp(2.0, width - box_w - 2.0);
+                    let box_y = 14.0;
+
+                    c.draw_rect(
+                        vg::Rect::new(box_x, box_y, box_x + box_w, box_y + box_h),
+                        &fill_paint(col(0.05, 0.05, 0.05, 0.92)),
+                    );
+                    c.draw_rect(
+                        vg::Rect::new(box_x, box_y, box_x + box_w, box_y + box_h),
+                        &stroke_paint(col(1.0, 0.6, 0.1, 0.7), 1.0),
+                    );
+                    let text_y = box_y + font_size + padding * 0.3;
+                    fill_text(c, &tooltip_text, box_x + padding, text_y, font_size, rgb(1.0, 0.9, 0.8));
+                }
+
+                if let Some(eq) = &self.eq_curve {
+                    if eq.points.len() >= 2 {
+                        let eq_range = eq.max_db - eq.min_db;
+                        let eq_to_y = |db: f32| -> f32 {
+                            let norm = ((db - eq.min_db) / eq_range).clamp(0.0, 1.0);
+                            height - norm * height
+                        };
+                        let (er, eg, eb) = (
+                            eq.line_color.r() as f32 / 255.0,
+                            eq.line_color.g() as f32 / 255.0,
+                            eq.line_color.b() as f32 / 255.0,
+                        );
+                        let ea = eq.line_color.a() as f32 / 255.0;
+
+                        let mut line_builder = vg::PathBuilder::new();
+                        line_builder.move_to((eq.points[0].0 * width, eq_to_y(eq.points[0].1)));
+                        for &(x, db) in &eq.points[1..] {
+                            line_builder.line_to((x * width, eq_to_y(db)));
+                        }
+                        c.draw_path(
+                            &line_builder.detach(),
+                            &stroke_paint(col(er, eg, eb, ea), 1.6),
+                        );
+                    }
+                }
+            },
+        );
+    }
+}
+
+// ─── Spectrum Smoothing ──────────────────────────────────────────────────────
+
+/// 1/3-octave (tapering to 1/20 at the top) fractional-band smoothing.
+pub fn smooth_spectrum_third_octave(
+    spectrum: &[f32],
+    fft_size: usize,
+    sample_rate: f32,
+) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    smooth_spectrum_third_octave_into(spectrum, fft_size, sample_rate, &mut out);
+    out
+}
+
+/// In-place variant of [`smooth_spectrum_third_octave`]. Reuses `out` to avoid allocations.
+pub fn smooth_spectrum_third_octave_into(
+    spectrum: &[f32],
+    fft_size: usize,
+    sample_rate: f32,
+    out: &mut Vec<(f32, f32)>,
+) {
+    out.clear();
+    if spectrum.is_empty() {
+        return;
+    }
+
+    let log_min = 20.0_f32.ln();
+    let log_max = 20000.0_f32.ln();
+    let bin_hz = sample_rate / fft_size as f32;
+
+    const DENOM_LOW: f32 = 3.0;
+    const DENOM_HIGH: f32 = 20.0;
+    const F_LOW: f32 = 500.0;
+    const F_HIGH: f32 = 16000.0;
+    let taper_lo = F_LOW.ln();
+    let taper_hi = F_HIGH.ln();
+
+    // ponytail: testing reduced smoothing resolution for performance
+    const STEPS: usize = 240;
+
+    let len = spectrum.len();
+
+    SMOOTH_POWER.with(|p| {
+        let mut power = p.borrow_mut();
+        power.clear();
+        power.reserve(len);
+        for &db in spectrum {
+            power.push(10.0_f32.powf(db * 0.1));
+        }
+
+        out.clear();
+        out.reserve(STEPS + 1);
+        for i in 0..=STEPS {
+            let frac = i as f32 / STEPS as f32;
+            let ln_fc = log_min + (log_max - log_min) * frac;
+            let fc = ln_fc.exp();
+
+            let t = ((ln_fc - taper_lo) / (taper_hi - taper_lo)).clamp(0.0, 1.0);
+            let denom = DENOM_LOW + (DENOM_HIGH - DENOM_LOW) * t;
+
+            let half = 2.0_f32.powf(1.0 / (2.0 * denom));
+            const MIN_BIN: f32 = 1.0;
+            let lo = (fc / half / bin_hz).clamp(MIN_BIN, (len - 1) as f32);
+            let hi = (fc * half / bin_hz).clamp(MIN_BIN, (len - 1) as f32);
+
+            let avg_power = if hi - lo >= 1.0 {
+                let i0 = lo.floor() as usize;
+                let i1 = hi.floor() as usize;
+                let mut sum = 0.0f32;
+                if i0 == i1 {
+                    sum = power[i0] * (hi - lo);
+                } else {
+                    sum += power[i0] * ((i0 + 1) as f32 - lo);
+                    for p in &power[i0 + 1..i1] {
+                        sum += *p;
+                    }
+                    sum += power[i1] * (hi - i1 as f32);
+                }
+                sum / (hi - lo)
+            } else {
+                let pos = (fc / bin_hz).clamp(MIN_BIN, (len - 1) as f32);
+                let i0 = pos.floor() as usize;
+                let i1 = (i0 + 1).min(len - 1);
+                let t_bin = pos - i0 as f32;
+                power[i0] * (1.0 - t_bin) + power[i1] * t_bin
+            };
+
+            let avg_db = (10.0 * avg_power.max(1e-12).log10()).clamp(-90.0, 12.0);
+            out.push((frac, avg_db));
+        }
+    });
+
+    if out.len() >= 3 {
+        SMOOTH_DB.with(|d| {
+            let mut smoothed_db = d.borrow_mut();
+            smoothed_db.clear();
+            smoothed_db.reserve(out.len());
+            for &(_, db) in out.iter() {
+                smoothed_db.push(db);
+            }
+            for i in 1..out.len().saturating_sub(1) {
+                out[i].1 =
+                    smoothed_db[i - 1] * 0.25 + smoothed_db[i] * 0.5 + smoothed_db[i + 1] * 0.25;
+            }
+        });
+    }
+}
