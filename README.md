@@ -1,4 +1,4 @@
-# LX AudioLabs — CLAP Audio Plugins
+# OLD LX AudioLabs — CLAP Audio Plugins using Vizia
 
 Open-source audio effect plugins in [CLAP](https://cleveraudio.org/) format, built with [truce](https://github.com/LX-Audiolabs/truce) and Rust.
 
@@ -87,6 +87,3 @@ cargo truce validate --clap -p equilibrium
 
 [GNU General Public License v3.0](LICENSE) — Copyright 2024–2026 LX AudioLabs
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports welcome.
